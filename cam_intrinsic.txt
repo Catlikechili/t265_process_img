@@ -1,0 +1,24 @@
+==================================================
+CAMERA INTRINSIC CONFIGURATION (FISHEYE MODEL)
+==================================================
+
+Stereo RMS Calibration Error: 0.378201 pixels
+
+--- LEFT CAMERA (FISHEYE 1) ---
+Intrinsic Matrix (K_left):
+311.824889   0.000000 409.163080
+  0.000000 311.267217 415.720185
+  0.000000   0.000000   1.000000
+
+Distortion Coefficients (D_left) [k1, k2, k3, k4]:
+ -0.094808   0.271351  -0.464782   0.290414
+
+
+--- RIGHT CAMERA (FISHEYE 2) ---
+Intrinsic Matrix (K_right):
+301.412414   0.000000 416.551563
+  0.000000 302.293132 409.849962
+  0.000000   0.000000   1.000000
+
+Distortion Coefficients (D_right) [k1, k2, k3, k4]:
+ -0.032813  -0.023566   0.064681  -0.024126

@@ -1,0 +1,32 @@
+==================================================
+     THÔNG SỐ NỘI THAM CAMERA INTEL REALSENSE T265
+==================================================
+
+--- LEFT CAMERA (FISHEYE 1) ---
+Resolution: 848x800
+Distortion Model: distortion.kannala_brandt4
+
+Intrinsic Matrix (K):
+  [  284.611786     0.000000   420.233612]
+  [    0.000000   285.758209   407.466888]
+  [    0.000000     0.000000     1.000000]
+
+Distortion Coefficients (D) [k1, k2, k3, k4]:
+  [ -0.001190,   0.037810,  -0.035387,   0.005361]
+
+--------------------------------------------------
+
+--- RIGHT CAMERA (FISHEYE 2) ---
+Resolution: 848x800
+Distortion Model: distortion.kannala_brandt4
+
+Intrinsic Matrix (K):
+  [  284.981995     0.000000   428.147308]
+  [    0.000000   286.101807   405.857910]
+  [    0.000000     0.000000     1.000000]
+
+Distortion Coefficients (D) [k1, k2, k3, k4]:
+  [ -0.000164,   0.036114,  -0.033729,   0.004820]
+
+--------------------------------------------------
+
