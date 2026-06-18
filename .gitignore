@@ -2,5 +2,5 @@
 /captured_fisheye2/
 /fisheye1_undistorted/
 /fisheye2_undistorted/
-cam_extrinsics.txt
-cam_intrinsics.txt
+cam_extrinsic.txt
+cam_intrinsic.txt
