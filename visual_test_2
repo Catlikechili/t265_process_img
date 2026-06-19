@@ -1,0 +1,210 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from matplotlib.animation import FuncAnimation
+
+# ==================================================
+# 1. ĐỌC FILE CSV MỚI NHẤT
+# ==================================================
+def get_latest_csv(log_dir="logs"):
+    """Lấy file CSV mới nhất trong thư mục logs"""
+    csv_files = [f for f in os.listdir(log_dir) if f.endswith('.csv')]
+    if not csv_files:
+        raise FileNotFoundError("Không tìm thấy file CSV nào trong thư mục logs!")
+    
+    csv_files.sort(reverse=True)
+    latest_file = os.path.join(log_dir, csv_files[0])
+    print(f"📂 Đọc file: {latest_file}")
+    return latest_file
+
+# Đọc dữ liệu
+csv_path = get_latest_csv()
+df = pd.read_csv(csv_path)
+
+print(f"📊 Tổng số điểm dữ liệu: {len(df)}")
+
+# ==================================================
+# 2. TÍNH TOÁN TỌA ĐỘ
+# ==================================================
+# Chuyển đổi sang tọa độ Cartesian (robot ở gốc 0,0)
+x_pos = df['KhoangCach(m)'] * np.sin(np.radians(df['GocLech(do)']))
+y_pos = df['KhoangCach(m)'] * np.cos(np.radians(df['GocLech(do)']))
+
+# ==================================================
+# 3. ANIMATION: HIỂN THỊ TỪNG ĐIỂM MỘT
+# ==================================================
+print("\n🎬 Đang tạo animation...")
+
+# Tạo figure
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# Vẽ robot ở vị trí (0,0)
+robot_size = 0.3
+robot = plt.Circle((0, 0), robot_size, color='black', fill=True, zorder=10)
+ax.add_patch(robot)
+
+# Vẽ hướng nhìn của robot
+ax.arrow(0, 0, 0, 0.5, head_width=0.1, head_length=0.1, fc='black', ec='black', alpha=0.5)
+
+# Cài đặt biểu đồ
+ax.set_xlabel('X (m)', fontsize=14)
+ax.set_ylabel('Y (m)', fontsize=14)
+ax.set_title('🗺️ Quỹ đạo chuyển động', fontsize=16)
+ax.grid(True, alpha=0.3)
+ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+ax.axvline(x=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+ax.set_aspect('equal')
+
+# Thêm các vòng tròn khoảng cách tham chiếu
+for radius in [1, 2, 3, 4, 5]:
+    circle = plt.Circle((0, 0), radius, color='gray', fill=False, linestyle=':', alpha=0.3)
+    ax.add_patch(circle)
+    ax.text(radius * 0.7, radius * 0.7, f'{radius}m', color='gray', alpha=0.5)
+
+# Tính giới hạn
+max_range = max(abs(x_pos.min()), abs(x_pos.max()), abs(y_pos.min()), abs(y_pos.max())) + 1.0
+ax.set_xlim(-max_range, max_range)
+ax.set_ylim(-max_range, max_range)
+
+# Thêm legend
+ax.legend(['Robot'], loc='upper right', fontsize=12)
+
+# Chuẩn bị dữ liệu animation
+x_data = []
+y_data = []
+scatter_plot = None
+line_plot = None
+
+def init():
+    """Khởi tạo animation"""
+    return []
+
+def update(frame):
+    """Cập nhật từng frame"""
+    global scatter_plot, line_plot
+    
+    # Xóa các đối tượng cũ
+    if scatter_plot is not None:
+        scatter_plot.remove()
+    if line_plot is not None:
+        line_plot.remove()
+    
+    # Lấy dữ liệu đến frame hiện tại
+    current_frame = frame + 1
+    x_data.append(x_pos.iloc[frame])
+    y_data.append(y_pos.iloc[frame])
+    
+    # Vẽ đường đi (quỹ đạo)
+    if len(x_data) > 1:
+        line_plot, = ax.plot(x_data, y_data, 'b-', linewidth=1.5, alpha=0.4, label='Quỹ đạo')
+    
+    # Vẽ tất cả các điểm đã xuất hiện
+    scatter_plot = ax.scatter(x_data, y_data, 
+                             c=range(len(x_data)), 
+                             cmap='plasma', 
+                             s=80, 
+                             alpha=0.8, 
+                             edgecolors='black', 
+                             linewidth=0.5,
+                             label='Vị trí object')
+    
+    # Đánh dấu điểm hiện tại (lớn hơn và nổi bật)
+    current_point = ax.scatter(x_data[-1], y_data[-1], 
+                              c='red', 
+                              s=200, 
+                              marker='*', 
+                              zorder=5, 
+                              edgecolors='black', 
+                              linewidth=2,
+                              label='Điểm hiện tại')
+    
+    # Đánh dấu điểm đầu tiên (nếu có)
+    if len(x_data) == 1:
+        start_point = ax.scatter(x_data[0], y_data[0], 
+                                c='green', 
+                                s=150, 
+                                marker='o', 
+                                zorder=5, 
+                                edgecolors='black', 
+                                linewidth=2,
+                                label='Điểm đầu')
+    else:
+        # Chỉ giữ điểm đầu và điểm cuối
+        for artist in ax.get_children():
+            if hasattr(artist, 'get_label') and artist.get_label() == 'Điểm đầu':
+                artist.remove()
+        
+        start_point = ax.scatter(x_data[0], y_data[0], 
+                                c='green', 
+                                s=150, 
+                                marker='o', 
+                                zorder=5, 
+                                edgecolors='black', 
+                                linewidth=2,
+                                label='Điểm đầu')
+    
+    # Cập nhật title với thông tin frame
+    ax.set_title(f'🗺️ Quỹ đạo chuyển động (Frame {current_frame}/{len(df)})\n'
+                f'Điểm #{current_frame}: Khoảng cách {df["KhoangCach(m)"].iloc[frame]:.2f}m, '
+                f'Góc {df["GocLech(do)"].iloc[frame]:.1f}°', fontsize=14)
+    
+    # Cập nhật thông tin tóm tắt
+    if current_frame > 0:
+        current_dist = df['KhoangCach(m)'].iloc[:current_frame].mean()
+        textstr = f'Điểm: {current_frame}/{len(df)}\n'
+        textstr += f'Khoảng cách TB: {current_dist:.2f}m'
+        
+        # Xóa text cũ nếu có
+        for artist in ax.get_children():
+            if hasattr(artist, 'get_text') and 'Điểm:' in artist.get_text():
+                artist.remove()
+        
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    return [scatter_plot, line_plot, current_point, start_point]
+
+# Tạo animation
+anim = FuncAnimation(fig, update, frames=len(df), 
+                     init_func=init, interval=200, repeat=False)
+
+# Lưu animation
+try:
+    anim.save('logs/trajectory_animation.gif', writer='pillow', fps=5)
+    print("✅ Đã lưu animation tại: logs/trajectory_animation.gif")
+except Exception as e:
+    print(f"⚠️ Không thể lưu animation: {e}")
+
+plt.show()
+
+# ==================================================
+# 4. IN THÔNG TIN TÓM TẮT
+# ==================================================
+print("\n" + "="*50)
+print("📊 TÓM TẮT DỮ LIỆU:")
+print("="*50)
+print(f"• Tổng số điểm: {len(df)}")
+print(f"• Khoảng cách trung bình: {df['KhoangCach(m)'].mean():.2f} m")
+print(f"• Khoảng cách min: {df['KhoangCach(m)'].min():.2f} m")
+print(f"• Khoảng cách max: {df['KhoangCach(m)'].max():.2f} m")
+print(f"• Góc lệch trung bình: {df['GocLech(do)'].mean():.2f}°")
+print(f"• Góc lệch min: {df['GocLech(do)'].min():.2f}°")
+print(f"• Góc lệch max: {df['GocLech(do)'].max():.2f}°")
+
+if len(df) > 1:
+    # Tính khoảng cách di chuyển tổng
+    dx = x_pos.diff()
+    dy = y_pos.diff()
+    total_distance = np.sum(np.sqrt(dx**2 + dy**2))
+    print(f"• Tổng quãng đường di chuyển: {total_distance:.2f} m")
+    
+    # Tốc độ trung bình
+    time_per_frame = 1/3  # 3Hz
+    total_time = len(df) * time_per_frame
+    avg_speed = total_distance / total_time if total_time > 0 else 0
+    print(f"• Tốc độ trung bình: {avg_speed:.2f} m/s")
+    print(f"• Thời gian ghi dữ liệu: {total_time:.1f} giây")
+
+print("="*50)
+print("✅ Visualize hoàn tất!")
