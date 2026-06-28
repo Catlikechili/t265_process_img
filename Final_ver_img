@@ -1,0 +1,179 @@
+import sys
+# Giữ nguyên đường dẫn hệ thống của bạn như yêu cầu
+sys.path.append('/home/longcv/librealsense/build/wrappers/python')
+
+import pyrealsense2 as rs
+import cv2
+import numpy as np
+import os
+import time
+from datetime import datetime
+
+# ==============================================================================
+# CẤU HÌNH CHẾ ĐỘ CHẠY (BẠN THAY ĐỔI THÔNG SỐ Ở ĐÂY)
+# ==============================================================================
+VERSION_ANGLE = 1  # 1: Tính góc có Z (Dùng hình học không gian), 2: Không có Z (Dùng pixel & FOV)
+VERSION_OUTPUT = 1 # 1: In log ra terminal, ghi file, hiển thị ảnh; 2: Không in gì cả (Chạy ngầm)
+
+# ==============================================================================
+# 0. KHỞI TẠO MÔ HÌNH AI & CAMERA T265
+# ==============================================================================
+prototxt_path = 'MobileNetSSD_deploy.prototxt'
+caffemodel_path = 'MobileNetSSD_deploy.caffemodel'
+
+if VERSION_OUTPUT == 1 and (not os.path.exists(prototxt_path) or not os.path.exists(caffemodel_path)):
+    raise FileNotFoundError("Thiếu file mô hình MobileNet-SSD!")
+
+net = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+
+pipe = rs.pipeline()
+cfg = rs.config()
+cfg.enable_stream(rs.stream.fisheye, 1) 
+cfg.enable_stream(rs.stream.fisheye, 2) 
+
+if VERSION_OUTPUT == 1:
+    print("[HỆ THỐNG] Đang khởi động camera T265...")
+profile = pipe.start(cfg)
+
+# KÍCH THƯỚC GỐC VÀ TỶ LỆ GIẢM (Tối ưu tính toán)
+orig_w, orig_h = 848, 800
+SCALE_FACTOR = 0.5
+new_w, new_h = int(orig_w * SCALE_FACTOR), int(orig_h * SCALE_FACTOR) # 424 x 400
+image_size = (new_w, new_h)
+
+# Cấu hình log nếu chọn VERSION_OUTPUT = 1
+if VERSION_OUTPUT == 1:
+    log_dir = "logs"
+    if not os.path.exists(log_dir): os.makedirs(log_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = open(f"{log_dir}/robot_log_{timestamp}.txt", 'w', encoding='utf-8')
+
+# ==============================================================================
+# 1. CẤU HÌNH THÔNG SỐ NỘI THAM / CĂN CHỈNH ẢNH (RECTIFY) THEO SIZE MỚI
+# ==============================================================================
+cx = 420.233612 * SCALE_FACTOR
+cy = 407.466888 * SCALE_FACTOR
+fx = 284.611786 * SCALE_FACTOR
+fy = 285.758209 * SCALE_FACTOR
+
+K1 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+K2 = np.array([[284.981995 * SCALE_FACTOR, 0.0, 428.147308 * SCALE_FACTOR],
+               [0.0, 286.101807 * SCALE_FACTOR, 405.857910 * SCALE_FACTOR],
+               [0.0, 0.0, 1.0]], dtype=np.float64)
+
+D1 = np.array([-0.005314, 0.041641, -0.039234, 0.007532], dtype=np.float64)
+D2 = np.array([-0.005123, 0.040124, -0.037531, 0.007122], dtype=np.float64)
+R_stereo = np.eye(3, dtype=np.float64)
+T_stereo = np.array([[-0.064], [0.0], [0.0]], dtype=np.float64) 
+
+# Tính toán ma trận nắn thẳng lập thể dựa trên ảnh cấu hình thu nhỏ
+R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(K1, D1, K2, D2, image_size, R_stereo, T_stereo, flags=cv2.fisheye.CALIB_ZERO_DISPARITY, balance=0.0)
+map1x, map1y = cv2.fisheye.initUndistortRectifyMap(K1, D1, R1, P1, image_size, cv2.CV_32FC1)
+map2x, map2y = cv2.fisheye.initUndistortRectifyMap(K2, D2, R2, P2, image_size, cv2.CV_32FC1)
+
+# Bộ khớp lập thể (Stereo Matcher)
+NUM_DISPARITIES = 32
+BLOCK_SIZE = 15
+stereo = cv2.StereoBM_create(numDisparities=NUM_DISPARITIES, blockSize=BLOCK_SIZE)
+
+H_FOV, V_FOV = 110.0, 100.0  # Dùng cho phương án góc không Z
+frame_count = 0
+
+try:
+    while True:
+        frames = pipe.poll_for_frames()
+        if not frames:
+            time.sleep(0.001)
+            continue
+            
+        f1 = frames.get_fisheye_frame(1)
+        f2 = frames.get_fisheye_frame(2)
+        if not f1 or not f2: continue
+            
+        # --- BƯỚC 1: GIẢM KÍCH THƯỚC NGAY TỪ ĐẦU VÀ RECTIFY ---
+        img_left_raw = np.asanyarray(f1.get_data())
+        img_right_raw = np.asanyarray(f2.get_data())
+        
+        img_left_resized = cv2.resize(img_left_raw, image_size)
+        img_right_resized = cv2.resize(img_right_raw, image_size)
+        
+        rectified_left = cv2.remap(img_left_resized, map1x, map1y, cv2.INTER_LINEAR)
+        rectified_right = cv2.remap(img_right_resized, map2x, map2y, cv2.INTER_LINEAR)
+        
+        # --- BƯỚC 2: AI NHẬN DIỆN TRÊN ẢNH RECTIFIED TRÁI ---
+        img_rgb_detect = cv2.cvtColor(rectified_left, cv2.COLOR_GRAY2BGR)
+        blob = cv2.dnn.blobFromImage(cv2.resize(img_rgb_detect, (300, 300)), 0.007843, (300, 300), 127.5)
+        net.setInput(blob)
+        detections = net.forward()
+        
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > 0.5:  # Ngưỡng nhận diện 50%
+                class_id = int(detections[0, 0, i, 1])
+                if class_id == 15:  # Lọc đúng class Con người (Person)
+                    
+                    # Trích xuất tọa độ Bounding Box tương thích với size (424x400)
+                    box = detections[0, 0, i, 3:7] * np.array([new_w, new_h, new_w, new_h])
+                    x1, y1, x2, y2 = np.clip(box.astype("int"), [0, 0, 0, 0], [new_w-1, new_h-1, new_w-1, new_h-1])
+                    
+                    x_center = (x1 + x2) / 2.0
+                    y_center = (y1 + y2) / 2.0
+                    
+                    # --- BƯỚC 3: TÍNH DISPARITY & KHOẢNG CÁCH Z VÙNG TARGET ---
+                    pad = 8
+                    y1_p, y2_p = max(0, y1-pad), min(new_h, y2+pad)
+                    x1_p, x2_p = max(0, x1-pad), min(new_w, x2+pad)
+                    
+                    crop_left = rectified_left[y1_p:y2_p, x1_p:x2_p]
+                    crop_right = rectified_right[y1_p:y2_p, x1_p:x2_p]
+                    
+                    disparity_crop = stereo.compute(crop_left, crop_right).astype(np.float32) / 16.0
+                    valid_pixels = disparity_crop[disparity_crop > 0]
+                    
+                    avg_disparity = np.median(valid_pixels) if len(valid_pixels) > 0 else 0.1
+                    # Công thức Z = (f * B) / d
+                    distance_z = (fx * 0.064) / avg_disparity
+                    
+                    # --- BƯỚC 4: LỰA CHỌN PHIÊN BẢN TÍNH GÓC ---
+                    if VERSION_ANGLE == 1:
+                        # PHIÊN BẢN 1: Tính góc bằng tọa độ 3D không gian (Cần Z thực tế)
+                        X_space = (x_center - cx) * distance_z / fx
+                        Y_space = (y_center - cy) * distance_z / fy
+                        angle_x = np.degrees(np.arctan2(X_space, distance_z))
+                        angle_y = np.degrees(np.arctan2(-Y_space, distance_z)) # Đảo trục Y hướng lên trên
+                    else:
+                        # PHIÊN BẢN 2: Tính góc hình học tuyến tính thô từ Pixel & FOV (Không cần Z)
+                        angle_x = ((x_center - (new_w / 2.0)) / new_w) * H_FOV
+                        angle_y = -((y_center - (new_h / 2.0)) / new_h) * V_FOV
+                    
+                    # Hướng di chuyển cho Robot
+                    direction = "RIGHT" if angle_x > 2.0 else ("LEFT" if angle_x < -2.0 else "STRAIGHT")
+                    
+                    # --- BƯỚC 5: XỬ LÝ ĐẦU RA THEO LỰA CHỌN LOG ---
+                    if VERSION_OUTPUT == 1:
+                        frame_count += 1
+                        current_timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        
+                        # In trực tiếp ra màn hình terminal
+                        print(f"[{current_timestamp}] Frame: {frame_count} | Mode Góc: V{VERSION_ANGLE} | Z: {distance_z:.2f}m | Góc X: {angle_x:.1f}° | Hướng: {direction}")
+                        
+                        # Ghi log văn bản vào file
+                        log_file.write(f"Time: {current_timestamp} | Z: {distance_z:.3f}m | AngleX: {angle_x:.2f} | Dir: {direction}\n")
+                        log_file.flush()
+                        
+                        # Vẽ đồ họa hiển thị trực quan UI OpenCV
+                        cv2.rectangle(img_rgb_detect, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.circle(img_rgb_detect, (int(x_center), int(y_center)), 4, (0, 255, 255), -1)
+                        cv2.putText(img_rgb_detect, f"{distance_z:.2f}m | {angle_x:.1f}deg", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        cv2.imshow("Robot Screen Output", img_rgb_detect)
+                        
+        if VERSION_OUTPUT == 1 and cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+finally:
+    if VERSION_OUTPUT == 1:
+        log_file.close()
+        cv2.destroyAllWindows()
+    pipe.stop()
