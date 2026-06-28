@@ -1,0 +1,271 @@
+import sys
+sys.path.append('/home/longcv/librealsense/build/wrappers/python')
+
+import pyrealsense2 as rs
+import cv2
+import numpy as np
+import os
+import time
+from datetime import datetime
+
+# ==================================================
+# 0. KHỞI TẠO MÔ HÌNH AI
+# ==================================================
+prototxt_path = 'MobileNetSSD_deploy.prototxt'
+caffemodel_path = 'MobileNetSSD_deploy.caffemodel'
+
+if not os.path.exists(prototxt_path) or not os.path.exists(caffemodel_path):
+    raise FileNotFoundError("Thiếu file mô hình MobileNet-SSD!")
+
+net = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+
+# ==================================================
+# 1. KHỞI ĐỘNG CAMERA T265
+# ==================================================
+pipe = rs.pipeline()
+cfg = rs.config()
+cfg.enable_stream(rs.stream.fisheye, 1) 
+cfg.enable_stream(rs.stream.fisheye, 2) 
+
+print("[HỆ THỐNG] Đang khởi động luồng tính toán góc chuẩn (undistort + rectify)...")
+profile = pipe.start(cfg)
+
+orig_w, orig_h = 848, 800
+SCALE_FACTOR = 0.5
+new_w, new_h = int(orig_w * SCALE_FACTOR), int(orig_h * SCALE_FACTOR)  # 424x400
+image_size = (new_w, new_h)
+
+# ==================================================
+# 2. THAM SỐ NỘI THAM, MÉO (GỐC VÀ SCALE)
+# ==================================================
+# --- Ma trận nội tham gốc (dùng cho undistort) ---
+K1_raw = np.array([[284.611786, 0.0, 420.233612],
+                   [0.0, 285.758209, 407.466888],
+                   [0.0, 0.0, 1.0]], dtype=np.float64)
+K2_raw = np.array([[284.981995, 0.0, 428.147308],
+                   [0.0, 286.101807, 405.857910],
+                   [0.0, 0.0, 1.0]], dtype=np.float64)
+D1 = np.array([-0.005314, 0.041641, -0.039234, 0.007532], dtype=np.float64)
+D2 = np.array([-0.005123, 0.040124, -0.037531, 0.007122], dtype=np.float64)
+
+# --- Ma trận nội tham đã scale (cho rectify) và coi méo = 0 ---
+K1_scaled = K1_raw * SCALE_FACTOR
+K1_scaled[2, 2] = 1.0
+K2_scaled = K2_raw * SCALE_FACTOR
+K2_scaled[2, 2] = 1.0
+D1_zero = np.zeros(5, dtype=np.float64)
+D2_zero = np.zeros(5, dtype=np.float64)
+
+R_stereo = np.eye(3, dtype=np.float64)
+T_stereo = np.array([[-0.064], [0.0], [0.0]], dtype=np.float64)
+
+# ==================================================
+# 3. TÍNH TOÁN BẢN ĐỒ RECTIFY (dùng stereoRectify thường, KHÔNG dùng fisheye)
+# ==================================================
+print("[INFO] Tính toán bản đồ rectification...")
+R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+    K1_scaled, D1_zero, K2_scaled, D2_zero,
+    image_size, R_stereo, T_stereo,
+    flags=cv2.CALIB_ZERO_DISPARITY,
+    alpha=0.0
+)
+map1x, map1y = cv2.initUndistortRectifyMap(K1_scaled, D1_zero, R1, P1, image_size, cv2.CV_32FC1)
+map2x, map2y = cv2.initUndistortRectifyMap(K2_scaled, D2_zero, R2, P2, image_size, cv2.CV_32FC1)
+
+# Lấy thông số từ P1 để tính góc
+fx_rect = P1[0, 0]
+fy_rect = P1[1, 1]
+cx_rect = P1[0, 2]
+cy_rect = P1[1, 2]
+print(f"[INFO] fx={fx_rect:.2f}, fy={fy_rect:.2f}, cx={cx_rect:.2f}, cy={cy_rect:.2f}")
+
+# ==================================================
+# 4. KHỞI TẠO BỘ KHỚP LẬP THỂ (StereoSGBM)
+# ==================================================
+NUM_DISPARITIES = 64
+BLOCK_SIZE = 5
+stereo_matcher = cv2.StereoSGBM_create(
+    minDisparity=0,
+    numDisparities=NUM_DISPARITIES,
+    blockSize=BLOCK_SIZE,
+    P1=8 * 3 * BLOCK_SIZE ** 2,
+    P2=32 * 3 * BLOCK_SIZE ** 2
+)
+
+# ==================================================
+# 5. KHỞI TẠO FILE LOG (SAU KHI ĐÃ CÓ new_w, new_h)
+# ==================================================
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"{log_dir}/t265_data_{timestamp}.txt"
+csv_filename = f"{log_dir}/t265_data_{timestamp}.csv"
+
+log_file = open(log_filename, 'w', encoding='utf-8')
+csv_file = open(csv_filename, 'w', encoding='utf-8')
+
+# Ghi header CSV
+csv_file.write("Timestamp,KhoangCach(m),GocLech(do),CenterX,CenterY,BoxX1,BoxY1,BoxX2,BoxY2,Confidence\n")
+
+# Ghi header log
+log_file.write(f"=== T265 DATA LOG (Undistort + Rectify) ===\n")
+log_file.write(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+log_file.write(f"Image Size: {new_w}x{new_h}\n")
+log_file.write(f"Processing Interval: 3.0 Hz\n")
+log_file.write("=" * 50 + "\n\n")
+log_file.flush()
+
+frame_count = 0
+last_process_time = 0
+PROCESS_INTERVAL = 1.0 / 3.0
+
+print("\n[READY] Đang quét... (xử lý und+rect+AI+disparity+góc)")
+print("---------------------------------------------------------")
+
+try:
+    while True:
+        frames = pipe.poll_for_frames()
+        if not frames:
+            time.sleep(0.01)
+            continue
+            
+        f1 = frames.get_fisheye_frame(1)
+        f2 = frames.get_fisheye_frame(2)
+        if not f1 or not f2:
+            continue
+            
+        current_time = time.time()
+        if (current_time - last_process_time) >= PROCESS_INTERVAL:
+            last_process_time = current_time
+            
+            # --- Đọc ảnh gốc ---
+            img_left_raw = np.asanyarray(f1.get_data())   # 848x800, grayscale
+            img_right_raw = np.asanyarray(f2.get_data())
+            
+            # --- Undistort (giống undistord.py) ---
+            left_undist = cv2.fisheye.undistortImage(img_left_raw, K1_raw, D1, Knew=K1_raw)
+            right_undist = cv2.fisheye.undistortImage(img_right_raw, K2_raw, D2, Knew=K2_raw)
+            
+            # --- Resize xuống 424x400 ---
+            left_undist_resized = cv2.resize(left_undist, (new_w, new_h))
+            right_undist_resized = cv2.resize(right_undist, (new_w, new_h))
+            
+            # --- Rectify (dùng map đã tính) ---
+            rectified_left = cv2.remap(left_undist_resized, map1x, map1y, cv2.INTER_LINEAR)
+            rectified_right = cv2.remap(right_undist_resized, map2x, map2y, cv2.INTER_LINEAR)
+            
+            # --- AI phát hiện người trên ảnh rectified_left ---
+            # Resize ảnh rectified_left về 300x300 để đưa vào MobileNet-SSD
+            img_for_ai = cv2.resize(rectified_left, (300, 300))
+            img_rgb = cv2.cvtColor(img_for_ai, cv2.COLOR_GRAY2BGR)
+            blob = cv2.dnn.blobFromImage(img_rgb, 0.007843, (300, 300), 127.5)
+            net.setInput(blob)
+            detections = net.forward()
+            
+            found_person = False
+            
+            for i in range(detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
+                if confidence > 0.4:
+                    class_id = int(detections[0, 0, i, 1])
+                    if class_id == 15:  # person
+                        # Box trên ảnh 300x300
+                        box_300 = detections[0, 0, i, 3:7] * np.array([300, 300, 300, 300])
+                        x1_300, y1_300, x2_300, y2_300 = box_300.astype("int")
+                        
+                        # Scale về 424x400
+                        scale_x = new_w / 300.0
+                        scale_y = new_h / 300.0
+                        x1 = int(x1_300 * scale_x)
+                        y1 = int(y1_300 * scale_y)
+                        x2 = int(x2_300 * scale_x)
+                        y2 = int(y2_300 * scale_y)
+                        
+                        # Giới hạn trong ảnh
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(new_w-1, x2), min(new_h-1, y2)
+                        
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        
+                        x_center = (x1 + x2) / 2.0
+                        y_center = (y1 + y2) / 2.0
+                        
+                        # --- Tính Disparity trên vùng crop ---
+                        pad = 8
+                        y1_p = max(0, y1 - pad)
+                        y2_p = min(new_h, y2 + pad)
+                        x1_p = max(0, x1 - pad)
+                        x2_p = min(new_w, x2 + pad)
+                        
+                        crop_left = rectified_left[y1_p:y2_p, x1_p:x2_p]
+                        crop_right = rectified_right[y1_p:y2_p, x1_p:x2_p]
+                        
+                        disparity_crop = stereo_matcher.compute(crop_left, crop_right).astype(np.float32) / 16.0
+                        valid_pixels = disparity_crop[(disparity_crop > 0.1) & (disparity_crop < NUM_DISPARITIES)]
+                        
+                        if len(valid_pixels) == 0:
+                            continue
+                            
+                        avg_disparity = np.median(valid_pixels)
+                        # Công thức Z = (fx * B) / d, với B = 0.064 m (lấy từ P1)
+                        B = 1.0 / Q[3, 2] if Q[3, 2] != 0 else 0.064
+                        if B < 0: B = -B
+                        distance_z = (fx_rect * B) / avg_disparity
+                        
+                        # --- Tính góc (có Z) ---
+                        X_space = (x_center - cx_rect) * distance_z / fx_rect
+                        Y_space = (y_center - cy_rect) * distance_z / fy_rect
+                        angle_x = np.degrees(np.arctan2(X_space, distance_z))
+                        angle_y = np.degrees(np.arctan2(-Y_space, distance_z))  # dương khi hướng lên
+                        
+                        # Tăng biến đếm và ghi log
+                        frame_count += 1
+                        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        
+                        # Ghi log file văn bản
+                        log_file.write(f"Frame #{frame_count:06d}\n")
+                        log_file.write(f"  Time: {current_timestamp}\n")
+                        log_file.write(f"  KhoangCach: {distance_z:.3f} m\n")
+                        log_file.write(f"  GocLech: {angle_x:.2f}°\n")
+                        log_file.write(f"  Box: ({x1}, {y1}) -> ({x2}, {y2})\n")
+                        log_file.write(f"  Center: ({x_center:.1f}, {y_center:.1f})\n")
+                        log_file.write(f"  Confidence: {confidence:.3f}\n")
+                        log_file.write("-" * 40 + "\n")
+                        log_file.flush()
+                        
+                        # Ghi CSV
+                        csv_line = f"{current_timestamp},{distance_z:.3f},{angle_x:.2f},{x_center:.1f},{y_center:.1f},{x1},{y1},{x2},{y2},{confidence:.3f}\n"
+                        csv_file.write(csv_line)
+                        csv_file.flush()
+                        
+                        # In ra màn hình
+                        print(f"[DATA] KhoangCach: {distance_z:.2f}m | GocLech: {angle_x:.1f}° | Frame: {frame_count}")
+                        found_person = True
+                        break  # chỉ xử lý 1 người đầu tiên
+            
+            if not found_person:
+                # Nếu không có người, có thể in log hoặc bỏ qua
+                pass
+
+except KeyboardInterrupt:
+    print("\n[HỆ THỐNG] Đang ngắt luồng...")
+    
+finally:
+    # Ghi kết thúc log
+    log_file.write("\n" + "=" * 50 + "\n")
+    log_file.write(f"End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"Total Frames Recorded: {frame_count}\n")
+    log_file.write("=" * 50 + "\n")
+    
+    log_file.close()
+    csv_file.close()
+    
+    print(f"\n[DONE] Đã ghi {frame_count} frame dữ liệu vào:")
+    print(f"  - Log file: {log_filename}")
+    print(f"  - CSV file: {csv_filename}")
+    
+    pipe.stop()
+    print("[DONE] Đã đóng hệ thống.")
